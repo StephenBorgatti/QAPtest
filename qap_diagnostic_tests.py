@@ -135,10 +135,14 @@ def generate_degree_heterogeneous_matrix(n: int, density: float = 0.15,
     # Initialize with preferential attachment
     adj = np.zeros((n, n), dtype=int)
 
-    # Start with small connected component
-    adj[0, 1] = adj[1, 0] = 1
-    adj[1, 2] = adj[2, 1] = 1
-    adj[0, 2] = adj[2, 0] = 1
+    # Start with small connected component using RANDOM starting nodes
+    # (Fixed bug: previously always used nodes 0,1,2 which caused spurious
+    # correlation between independently generated networks)
+    start_nodes = np.random.choice(n, size=3, replace=False)
+    a, b, c = start_nodes
+    adj[a, b] = adj[b, a] = 1
+    adj[b, c] = adj[c, b] = 1
+    adj[a, c] = adj[c, a] = 1
 
     degrees = np.sum(adj, axis=1)
 
