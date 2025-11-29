@@ -156,9 +156,15 @@ generate_symmetric_network <- function(n, density = 0.15,
   adj <- matrix(0, n, n)
 
   # Create initial edges with preferential attachment
-  # Start with a small connected component
-  adj[1, 2] <- adj[2, 1] <- 1
-  adj[2, 3] <- adj[3, 2] <- 1
+  # Start with a small connected component using RANDOM starting nodes
+  # (Fixed bug: previously always used nodes 1,2,3 which caused spurious
+  # correlation between independently generated networks)
+  start_nodes <- sample(1:n, 3, replace = FALSE)
+  a <- start_nodes[1]
+  b <- start_nodes[2]
+  c <- start_nodes[3]
+  adj[a, b] <- adj[b, a] <- 1
+  adj[b, c] <- adj[c, b] <- 1
 
   degrees <- rowSums(adj)
 
@@ -365,10 +371,46 @@ vectorize_symmetric <- function(mat) {
 }
 
 
+#' Compute Robust Standard Errors Efficiently (HC3)
+#'
+#' Computes HC3 robust standard errors without forming full hat matrix.
+#' Uses the identity: diag(X %*% A %*% t(X)) = rowSums(X * (X %*% A))
+#'
+#' @param X Design matrix (n_obs x p)
+#' @param residuals Regression residuals
+#' @param xtx_inv Pre-computed (X'X)^-1
+#' @return Vector of robust standard errors
+compute_robust_se_fast <- function(X, residuals, xtx_inv) {
+  # Efficient computation of hat matrix diagonal
+  # h_i = X[i,] %*% xtx_inv %*% X[i,]' = sum(X[i,] * (X %*% xtx_inv)[i,])
+  X_xtx_inv <- X %*% xtx_inv
+  h <- rowSums(X * X_xtx_inv)
+
+  # HC3 adjustment
+  u <- residuals / (1 - h)
+
+  # Efficient meat matrix: X' diag(u^2) X = t(X * u) %*% (X * u) for elementwise
+  # Actually: sum_i u_i^2 * X[i,]' X[i,] = t(X) %*% diag(u^2) %*% X
+  # Efficient: (X * u)' %*% (X * u) where * is columnwise multiplication
+  Xu <- X * u  # Each row of X multiplied by corresponding u
+  meat <- crossprod(Xu)  # t(Xu) %*% Xu
+
+  robust_vcov <- xtx_inv %*% meat %*% xtx_inv
+  sqrt(diag(robust_vcov))
+}
+
+
 #' DSP QAP Regression with Robust Standard Errors
 #'
 #' Performs MRQAP regression using double semi-partialling (Dekker et al. 2007)
-#' with heteroskedasticity-consistent (robust) standard errors
+#' with heteroskedasticity-consistent (robust) standard errors.
+#'
+#' DSP Method (from Dekker, Krackhardt, Snijders 2007):
+#' For testing coefficient of X_k while controlling for Z (other predictors):
+#' 1. Compute residuals: eps_XZ = X_k - delta_hat * Z (partial out Z from X_k)
+#' 2. Permute these residuals: pi(eps_XZ)
+#' 3. Fit: Y = beta * pi(eps_XZ) + gamma * Z + E
+#' Key: Y is NOT permuted; only X residuals are permuted
 #'
 #' @param Y Dependent variable matrix (symmetric)
 #' @param X_list List of independent variable matrices (symmetric)
@@ -376,72 +418,155 @@ vectorize_symmetric <- function(mat) {
 #' @return List with coefficients, robust SEs, p-values, R-squared
 qap_dsp_regression_robust <- function(Y, X_list, nperm = 1000) {
 
+  n <- nrow(Y)
+  n_x <- length(X_list)
+
   # Vectorize matrices (upper triangle for symmetric)
   y_vec <- vectorize_symmetric(Y)
-  x_mat <- do.call(cbind, lapply(X_list, vectorize_symmetric))
-
-  # Add intercept
-  x_mat <- cbind(1, x_mat)
   n_obs <- length(y_vec)
+
+  # Vectorize all X matrices
+  x_vecs <- lapply(X_list, vectorize_symmetric)
+  x_mat <- cbind(1, do.call(cbind, x_vecs))
   n_params <- ncol(x_mat)
 
   # Observed regression
   obs_fit <- lm.fit(x_mat, y_vec)
   obs_coef <- obs_fit$coefficients
   obs_resid <- obs_fit$residuals
-  obs_fitted <- obs_fit$fitted.values
 
   # Calculate R-squared
   ss_res <- sum(obs_resid^2)
   ss_tot <- sum((y_vec - mean(y_vec))^2)
   r_squared <- 1 - ss_res / ss_tot
 
-  # Robust standard errors (HC3)
-  # Using sandwich estimator
-  hat_matrix <- x_mat %*% solve(t(x_mat) %*% x_mat) %*% t(x_mat)
-  h <- diag(hat_matrix)
-  u <- obs_resid / (1 - h)  # HC3 adjustment
+  # Robust standard errors (HC3) - using fast computation
+  xtx_inv <- solve(crossprod(x_mat))
+  robust_se <- compute_robust_se_fast(x_mat, obs_resid, xtx_inv)
 
-  bread <- solve(t(x_mat) %*% x_mat)
-  meat <- t(x_mat) %*% diag(u^2) %*% x_mat
-  robust_vcov <- bread %*% meat %*% bread
-  robust_se <- sqrt(diag(robust_vcov))
+  # T-statistics with robust SEs (pivotal statistic)
+  obs_tstats <- obs_coef / robust_se
 
-  # T-statistics with robust SEs
-  t_stats <- obs_coef / robust_se
+  # Pre-generate permutations for consistency across all coefficient tests
+  perms <- lapply(1:nperm, function(p) sample(1:n))
 
-  # Permutation test
-  n <- nrow(Y)
-  perm_coefs <- matrix(0, nrow = nperm, ncol = n_params)
+  # DSP Permutation test for each coefficient
+  # For coefficient k, we:
+  # 1. Partial out all other X's (Z) from X_k to get X_k residuals
+  # 2. Permute these residuals
+  # 3. Regress Y (NOT permuted) on permuted X_k residuals + Z (NOT permuted)
+
+  p_values <- numeric(n_params)
   perm_rsq <- numeric(nperm)
 
+  # For intercept (index 1), compute p-value using permutation of all X residuals
+  # For X coefficients (indices 2 to n_params), use proper DSP
+
+  for (k in 1:n_x) {
+    # Coefficient index in design matrix (k+1 because of intercept)
+    coef_idx <- k + 1
+
+    # Z = all X except X_k (the control variables)
+    if (n_x > 1) {
+      Z_indices <- setdiff(1:n_x, k)
+      Z_vecs <- lapply(Z_indices, function(j) x_vecs[[j]])
+      Z_mat_for_partial <- cbind(1, do.call(cbind, Z_vecs))
+
+      # Compute X_k residuals after partialing out Z
+      resid_fit <- lm.fit(Z_mat_for_partial, x_vecs[[k]])
+      x_k_resid_vec <- resid_fit$residuals
+
+      # Convert residual vector back to matrix form for permutation
+      x_k_resid_mat <- matrix(0, n, n)
+      x_k_resid_mat[upper.tri(x_k_resid_mat)] <- x_k_resid_vec
+      x_k_resid_mat <- x_k_resid_mat + t(x_k_resid_mat)  # Make symmetric
+    } else {
+      # Only one predictor, no partialing needed
+      x_k_resid_mat <- X_list[[k]]
+    }
+
+    # Permutation test for coefficient k
+    perm_tstats_k <- numeric(nperm)
+
+    for (p in 1:nperm) {
+      perm_idx <- perms[[p]]
+
+      # DSP: Permute X_k residuals (rows and columns simultaneously)
+      x_k_perm_mat <- x_k_resid_mat[perm_idx, perm_idx]
+      x_k_perm_vec <- vectorize_symmetric(x_k_perm_mat)
+
+      # Build design matrix: intercept, permuted X_k residuals, and Z (NOT permuted)
+      if (n_x > 1) {
+        Z_mat <- do.call(cbind, Z_vecs)
+        x_perm_design <- cbind(1, x_k_perm_vec, Z_mat)
+      } else {
+        x_perm_design <- cbind(1, x_k_perm_vec)
+      }
+
+      # Fit regression: Y (NOT permuted) on permuted X_k residuals + Z
+      perm_fit <- lm.fit(x_perm_design, y_vec)
+      perm_coef <- perm_fit$coefficients
+      perm_resid <- perm_fit$residuals
+
+      # Compute robust t-stat using fast method
+      xtx_inv_perm <- solve(crossprod(x_perm_design))
+      se_perm <- compute_robust_se_fast(x_perm_design, perm_resid, xtx_inv_perm)
+
+      # t-stat for the permuted X_k coefficient (always at index 2 in this design)
+      perm_tstats_k[p] <- perm_coef[2] / se_perm[2]
+
+      # Store R-squared for first coefficient's permutations
+      if (k == 1) {
+        perm_rsq[p] <- 1 - sum(perm_resid^2) / ss_tot
+      }
+    }
+
+    # Two-tailed p-value for coefficient k based on t-statistics (pivotal)
+    p_values[coef_idx] <- mean(abs(perm_tstats_k) >= abs(obs_tstats[coef_idx]))
+  }
+
+  # For intercept, use permutation test with all X residuals permuted
+  perm_tstats_intercept <- numeric(nperm)
+
+  # Compute residuals for all X's (each partialed from others)
+  x_resid_mats <- list()
+  for (k in 1:n_x) {
+    if (n_x > 1) {
+      Z_indices <- setdiff(1:n_x, k)
+      Z_mat_for_partial <- cbind(1, do.call(cbind, lapply(Z_indices, function(j) x_vecs[[j]])))
+      resid_fit <- lm.fit(Z_mat_for_partial, x_vecs[[k]])
+      x_k_resid_vec <- resid_fit$residuals
+      x_k_resid_mat <- matrix(0, n, n)
+      x_k_resid_mat[upper.tri(x_k_resid_mat)] <- x_k_resid_vec
+      x_k_resid_mat <- x_k_resid_mat + t(x_k_resid_mat)
+      x_resid_mats[[k]] <- x_k_resid_mat
+    } else {
+      x_resid_mats[[k]] <- X_list[[k]]
+    }
+  }
+
   for (p in 1:nperm) {
-    perm_idx <- sample(1:n)
+    perm_idx <- perms[[p]]
 
-    # Permute Y
-    Y_perm <- Y[perm_idx, perm_idx]
-    y_perm_vec <- vectorize_symmetric(Y_perm)
-
-    # Permute each X matrix (double semi-partialling)
-    x_perm_list <- lapply(X_list, function(x) {
-      x_perm <- x[perm_idx, perm_idx]
-      vectorize_symmetric(x_perm)
+    # Permute all X residual matrices with same permutation
+    x_perm_vecs <- lapply(x_resid_mats, function(mat) {
+      vectorize_symmetric(mat[perm_idx, perm_idx])
     })
-    x_perm_mat <- cbind(1, do.call(cbind, x_perm_list))
+    x_perm_design <- cbind(1, do.call(cbind, x_perm_vecs))
 
-    # Fit permuted model
-    perm_fit <- lm.fit(x_perm_mat, y_perm_vec)
-    perm_coefs[p, ] <- perm_fit$coefficients
+    # Fit regression: Y (NOT permuted) on permuted X residuals
+    perm_fit <- lm.fit(x_perm_design, y_vec)
+    perm_coef <- perm_fit$coefficients
+    perm_resid <- perm_fit$residuals
 
-    # Permuted R-squared
-    perm_rsq[p] <- 1 - sum(perm_fit$residuals^2) / sum((y_perm_vec - mean(y_perm_vec))^2)
+    # Compute robust t-stat for intercept using fast method
+    xtx_inv_perm <- solve(crossprod(x_perm_design))
+    se_perm <- compute_robust_se_fast(x_perm_design, perm_resid, xtx_inv_perm)
+
+    perm_tstats_intercept[p] <- perm_coef[1] / se_perm[1]
   }
 
-  # Two-tailed p-values based on permutation distribution
-  p_values <- numeric(n_params)
-  for (i in 1:n_params) {
-    p_values[i] <- mean(abs(perm_coefs[, i]) >= abs(obs_coef[i]))
-  }
+  p_values[1] <- mean(abs(perm_tstats_intercept) >= abs(obs_tstats[1]))
 
   # P-value for R-squared
   p_value_rsq <- mean(perm_rsq >= r_squared)
@@ -452,7 +577,7 @@ qap_dsp_regression_robust <- function(Y, X_list, nperm = 1000) {
   list(
     coefficients = obs_coef,
     robust_se = robust_se,
-    t_statistics = t_stats,
+    t_statistics = obs_tstats,
     p_values = p_values,
     r_squared = r_squared,
     p_value_rsq = p_value_rsq,
