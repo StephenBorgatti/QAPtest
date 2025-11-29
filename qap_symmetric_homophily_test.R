@@ -156,9 +156,15 @@ generate_symmetric_network <- function(n, density = 0.15,
   adj <- matrix(0, n, n)
 
   # Create initial edges with preferential attachment
-  # Start with a small connected component
-  adj[1, 2] <- adj[2, 1] <- 1
-  adj[2, 3] <- adj[3, 2] <- 1
+  # Start with a small connected component using RANDOM starting nodes
+  # (Fixed bug: previously always used nodes 1,2,3 which caused spurious
+  # correlation between independently generated networks)
+  start_nodes <- sample(1:n, 3, replace = FALSE)
+  a <- start_nodes[1]
+  b <- start_nodes[2]
+  c <- start_nodes[3]
+  adj[a, b] <- adj[b, a] <- 1
+  adj[b, c] <- adj[c, b] <- 1
 
   degrees <- rowSums(adj)
 
