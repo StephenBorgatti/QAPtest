@@ -148,7 +148,12 @@ def generate_degree_heterogeneous_matrix(n: int, density: float = 0.15,
 
     # Add edges using preferential attachment
     edges_added = 3
-    while edges_added < n_edges:
+    max_attempts = n_edges * 100  # Safeguard against infinite loop
+    attempts = 0
+
+    while edges_added < n_edges and attempts < max_attempts:
+        attempts += 1
+
         # Probability proportional to (degree + 1)^2 for stronger heterogeneity
         probs = (degrees + 1.0) ** 2
         probs = probs / np.sum(probs)
@@ -168,6 +173,16 @@ def generate_degree_heterogeneous_matrix(n: int, density: float = 0.15,
                 adj[i, j] = adj[j, i] = 1
                 degrees = np.sum(adj, axis=1)
                 edges_added += 1
+
+    # If preferential attachment stalled, fill remaining edges randomly
+    if edges_added < n_edges:
+        zeros = np.argwhere((adj == 0) & np.triu(np.ones_like(adj, dtype=bool), k=1))
+        if len(zeros) > 0:
+            remaining = n_edges - edges_added
+            selected = np.random.choice(len(zeros), size=min(remaining, len(zeros)), replace=False)
+            for idx in selected:
+                i, j = zeros[idx]
+                adj[i, j] = adj[j, i] = 1
 
     # Fine-tune to reach target CV
     for _ in range(max_iter):

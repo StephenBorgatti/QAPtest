@@ -42,8 +42,11 @@ def generate_degree_heterogeneous_matrix(n: int, density: float = 0.15,
 
     degrees = np.sum(adj, axis=1)
     edges_added = 3
+    max_attempts = n_edges * 100
+    attempts = 0
 
-    while edges_added < n_edges:
+    while edges_added < n_edges and attempts < max_attempts:
+        attempts += 1
         probs = (degrees + 1.0) ** 2
         probs = probs / np.sum(probs)
         i = np.random.choice(n, p=probs)
@@ -59,6 +62,16 @@ def generate_degree_heterogeneous_matrix(n: int, density: float = 0.15,
                 adj[i, j] = adj[j, i] = 1
                 degrees = np.sum(adj, axis=1)
                 edges_added += 1
+
+    # Fill remaining edges randomly if needed
+    if edges_added < n_edges:
+        zeros = np.argwhere((adj == 0) & np.triu(np.ones_like(adj, dtype=bool), k=1))
+        if len(zeros) > 0:
+            remaining = n_edges - edges_added
+            selected = np.random.choice(len(zeros), size=min(remaining, len(zeros)), replace=False)
+            for idx in selected:
+                i, j = zeros[idx]
+                adj[i, j] = adj[j, i] = 1
 
     return adj
 

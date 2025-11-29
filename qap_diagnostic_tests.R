@@ -135,7 +135,12 @@ generate_degree_heterogeneous_matrix <- function(n, density = 0.15,
 
   # Add edges using preferential attachment
   edges_added <- 3
-  while (edges_added < n_edges) {
+  max_attempts <- n_edges * 100  # Safeguard against infinite loop
+  attempts <- 0
+
+  while (edges_added < n_edges && attempts < max_attempts) {
+    attempts <- attempts + 1
+
     # Probability proportional to (degree + 1)^2 for stronger heterogeneity
     probs <- (degrees + 1)^2
     probs <- probs / sum(probs)
@@ -155,6 +160,20 @@ generate_degree_heterogeneous_matrix <- function(n, density = 0.15,
         adj[i, j] <- adj[j, i] <- 1
         degrees <- rowSums(adj)
         edges_added <- edges_added + 1
+      }
+    }
+  }
+
+  # If preferential attachment stalled, fill remaining edges randomly
+  if (edges_added < n_edges) {
+    zeros <- which(adj == 0 & upper.tri(adj), arr.ind = TRUE)
+    if (nrow(zeros) > 0) {
+      remaining <- n_edges - edges_added
+      selected <- sample(nrow(zeros), min(remaining, nrow(zeros)), replace = FALSE)
+      for (idx in selected) {
+        i <- zeros[idx, 1]
+        j <- zeros[idx, 2]
+        adj[i, j] <- adj[j, i] <- 1
       }
     }
   }
