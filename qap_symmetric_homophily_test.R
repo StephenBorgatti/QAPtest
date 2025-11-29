@@ -371,6 +371,35 @@ vectorize_symmetric <- function(mat) {
 }
 
 
+#' Compute Robust Standard Errors Efficiently (HC3)
+#'
+#' Computes HC3 robust standard errors without forming full hat matrix.
+#' Uses the identity: diag(X %*% A %*% t(X)) = rowSums(X * (X %*% A))
+#'
+#' @param X Design matrix (n_obs x p)
+#' @param residuals Regression residuals
+#' @param xtx_inv Pre-computed (X'X)^-1
+#' @return Vector of robust standard errors
+compute_robust_se_fast <- function(X, residuals, xtx_inv) {
+  # Efficient computation of hat matrix diagonal
+  # h_i = X[i,] %*% xtx_inv %*% X[i,]' = sum(X[i,] * (X %*% xtx_inv)[i,])
+  X_xtx_inv <- X %*% xtx_inv
+  h <- rowSums(X * X_xtx_inv)
+
+  # HC3 adjustment
+  u <- residuals / (1 - h)
+
+  # Efficient meat matrix: X' diag(u^2) X = t(X * u) %*% (X * u) for elementwise
+  # Actually: sum_i u_i^2 * X[i,]' X[i,] = t(X) %*% diag(u^2) %*% X
+  # Efficient: (X * u)' %*% (X * u) where * is columnwise multiplication
+  Xu <- X * u  # Each row of X multiplied by corresponding u
+  meat <- crossprod(Xu)  # t(Xu) %*% Xu
+
+  robust_vcov <- xtx_inv %*% meat %*% xtx_inv
+  sqrt(diag(robust_vcov))
+}
+
+
 #' DSP QAP Regression with Robust Standard Errors
 #'
 #' Performs MRQAP regression using double semi-partialling (Dekker et al. 2007)
@@ -411,15 +440,9 @@ qap_dsp_regression_robust <- function(Y, X_list, nperm = 1000) {
   ss_tot <- sum((y_vec - mean(y_vec))^2)
   r_squared <- 1 - ss_res / ss_tot
 
-  # Robust standard errors (HC3)
-  xtx_inv <- solve(t(x_mat) %*% x_mat)
-  hat_matrix <- x_mat %*% xtx_inv %*% t(x_mat)
-  h <- diag(hat_matrix)
-  u <- obs_resid / (1 - h)  # HC3 adjustment
-
-  meat <- t(x_mat) %*% diag(u^2) %*% x_mat
-  robust_vcov <- xtx_inv %*% meat %*% xtx_inv
-  robust_se <- sqrt(diag(robust_vcov))
+  # Robust standard errors (HC3) - using fast computation
+  xtx_inv <- solve(crossprod(x_mat))
+  robust_se <- compute_robust_se_fast(x_mat, obs_resid, xtx_inv)
 
   # T-statistics with robust SEs (pivotal statistic)
   obs_tstats <- obs_coef / robust_se
@@ -485,13 +508,9 @@ qap_dsp_regression_robust <- function(Y, X_list, nperm = 1000) {
       perm_coef <- perm_fit$coefficients
       perm_resid <- perm_fit$residuals
 
-      # Compute robust t-stat for the permuted X_k coefficient (index 2)
-      xtx_inv_perm <- solve(t(x_perm_design) %*% x_perm_design)
-      h_perm <- diag(x_perm_design %*% xtx_inv_perm %*% t(x_perm_design))
-      u_perm <- perm_resid / (1 - h_perm)
-      meat_perm <- t(x_perm_design) %*% diag(u_perm^2) %*% x_perm_design
-      vcov_perm <- xtx_inv_perm %*% meat_perm %*% xtx_inv_perm
-      se_perm <- sqrt(diag(vcov_perm))
+      # Compute robust t-stat using fast method
+      xtx_inv_perm <- solve(crossprod(x_perm_design))
+      se_perm <- compute_robust_se_fast(x_perm_design, perm_resid, xtx_inv_perm)
 
       # t-stat for the permuted X_k coefficient (always at index 2 in this design)
       perm_tstats_k[p] <- perm_coef[2] / se_perm[2]
@@ -540,13 +559,9 @@ qap_dsp_regression_robust <- function(Y, X_list, nperm = 1000) {
     perm_coef <- perm_fit$coefficients
     perm_resid <- perm_fit$residuals
 
-    # Compute robust t-stat for intercept
-    xtx_inv_perm <- solve(t(x_perm_design) %*% x_perm_design)
-    h_perm <- diag(x_perm_design %*% xtx_inv_perm %*% t(x_perm_design))
-    u_perm <- perm_resid / (1 - h_perm)
-    meat_perm <- t(x_perm_design) %*% diag(u_perm^2) %*% x_perm_design
-    vcov_perm <- xtx_inv_perm %*% meat_perm %*% xtx_inv_perm
-    se_perm <- sqrt(diag(vcov_perm))
+    # Compute robust t-stat for intercept using fast method
+    xtx_inv_perm <- solve(crossprod(x_perm_design))
+    se_perm <- compute_robust_se_fast(x_perm_design, perm_resid, xtx_inv_perm)
 
     perm_tstats_intercept[p] <- perm_coef[1] / se_perm[1]
   }
